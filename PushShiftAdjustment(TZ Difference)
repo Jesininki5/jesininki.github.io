@@ -1,0 +1,177 @@
+function pushShiftAdjustment() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Shift Lookup");
+  const data = sheet.getDataRange().getValues();
+  const HUMANITY_API_KEY = '92ecaf70c660c949db67ed99020edd51ec066611';
+  const BASE_URL = 'https://www.humanity.com/api/v2/';
+  const validLocationIds = getValidLocationIds(HUMANITY_API_KEY);
+
+  for (let i = 1; i < data.length; i++) {
+    const date = data[i][0];             // Column A
+    const newShiftTime = data[i][1];     // Column B
+    const shiftTime = data[i][3];        // Column D
+    const locationId = data[i][5];       // Column F
+    const position = data[i][6];         // Column G
+    const status = data[i][7];           // Column H
+    const shiftId = data[i][10];         // Column K
+
+    if (!date || !newShiftTime) continue;
+
+    const [startStr, endStr] = newShiftTime.split('-').map(s => s.trim());
+    if (!startStr || !endStr) {
+      sheet.getRange(i + 1, 8).setValue('INVALID NEW TIME');
+      continue;
+    }
+
+    // Parse input times
+    const startDate = new Date(date);
+    const endDate = new Date(date);
+    const [startHour, startMin] = startStr.split(':').map(Number);
+    const [endHour, endMin] = endStr.split(':').map(Number);
+
+    startDate.setHours(startHour, startMin);
+    endDate.setHours(endHour, endMin);
+
+    // Humanity shifts were 12 hours behind → Add 12 hours correction
+    startDate.setHours(startDate.getHours() + 12);
+    endDate.setHours(endDate.getHours() + 12);
+
+    if (endDate <= startDate) endDate.setDate(endDate.getDate() + 1);
+
+    const formattedStartDate = Utilities.formatDate(startDate, "America/New_York", "MMMM dd, yyyy");
+    const formattedEndDate = Utilities.formatDate(endDate, "America/New_York", "MMMM dd, yyyy");
+
+    const startFormatted = Utilities.formatDate(startDate, "America/New_York", "h:mma").toLowerCase();
+    const endFormatted = Utilities.formatDate(endDate, "America/New_York", "h:mma").toLowerCase();
+
+    // CASE 1: Adjust existing shift
+    if (status === 'MATCH FOUND' && shiftId) {
+      const shiftUrl = `${BASE_URL}shifts/${shiftId}`;
+
+      try {
+        // Step 1: Unpublish
+        UrlFetchApp.fetch(shiftUrl, {
+          method: 'put',
+          headers: { 'Authorization': `Bearer ${HUMANITY_API_KEY}`, 'Content-Type': 'application/json' },
+          payload: JSON.stringify({ published: "0" }),
+          muteHttpExceptions: true
+        });
+        Utilities.sleep(1000);
+
+        // Step 2: Update
+        const updatePayload = {
+          start_time: startFormatted,
+          end_time: endFormatted,
+          start_date: formattedStartDate,
+          end_date: formattedEndDate
+        };
+        const updateResponse = UrlFetchApp.fetch(shiftUrl, {
+          method: 'put',
+          headers: { 'Authorization': `Bearer ${HUMANITY_API_KEY}`, 'Content-Type': 'application/json' },
+          payload: JSON.stringify(updatePayload),
+          muteHttpExceptions: true
+        });
+        const updateResponseText = updateResponse.getContentText();
+        Utilities.sleep(1000);
+
+        // Step 3: Republish
+        UrlFetchApp.fetch(shiftUrl, {
+          method: 'put',
+          headers: { 'Authorization': `Bearer ${HUMANITY_API_KEY}`, 'Content-Type': 'application/json' },
+          payload: JSON.stringify({ published: "1" }),
+          muteHttpExceptions: true
+        });
+
+        const result = JSON.parse(updateResponseText);
+        if (result && result.data && result.data.id) {
+          sheet.getRange(i + 1, 8).setValue('ADJUSTED');
+          sheet.getRange(i + 1, 12).setValue(`Updated to ${startFormatted}-${endFormatted}`);
+        } else {
+          sheet.getRange(i + 1, 8).setValue('FAILED UPDATE');
+          sheet.getRange(i + 1, 12).setValue(updateResponseText);
+        }
+
+        sheet.getRange(i + 1, 13).setValue(JSON.stringify(updatePayload));
+        sheet.getRange(i + 1, 14).setValue(updateResponseText);
+
+      } catch (error) {
+        sheet.getRange(i + 1, 8).setValue('ERROR');
+        sheet.getRange(i + 1, 14).setValue(String(error));
+      }
+    }
+
+    // CASE 2: Create new shift
+    else if (typeof shiftTime === 'string' && shiftTime.toLowerCase().includes("new shift")) {
+      if (!validLocationIds.includes(String(locationId))) {
+        sheet.getRange(i + 1, 8).setValue('INVALID LOCATION ID');
+        continue;
+      }
+
+      try {
+        const createPayload = {
+          start_time: startFormatted,
+          end_time: endFormatted,
+          start_date: formattedStartDate,
+          end_date: formattedEndDate,
+          schedule_name: "AT - MAIN AT",  // ✅ Force position to "AT - MAIN AT"
+          location: locationId,
+          type: 0
+        };
+
+        const createResponse = UrlFetchApp.fetch(`${BASE_URL}shifts`, {
+          method: 'post',
+          headers: { 
+            'Authorization': `Bearer ${HUMANITY_API_KEY}`, 
+            'Content-Type': 'application/json' 
+          },
+          payload: JSON.stringify(createPayload),
+          muteHttpExceptions: true
+        });
+
+        const createResponseText = createResponse.getContentText();
+        const result = JSON.parse(createResponseText);
+
+        if (result && result.data && result.data.id) {
+          sheet.getRange(i + 1, 8).setValue('NEW SHIFT CREATED');
+          sheet.getRange(i + 1, 12).setValue(`Created: ${startFormatted}-${endFormatted}`);
+        } else {
+          sheet.getRange(i + 1, 8).setValue('FAILED CREATE');
+          sheet.getRange(i + 1, 12).setValue(createResponseText);
+        }
+
+        // Logging payload & response
+        sheet.getRange(i + 1, 13).setValue(JSON.stringify(createPayload));
+        sheet.getRange(i + 1, 14).setValue(createResponseText);
+
+      } catch (error) {
+        sheet.getRange(i + 1, 8).setValue('ERROR CREATE');
+        sheet.getRange(i + 1, 14).setValue(String(error));
+      }
+    }
+
+  }
+
+  SpreadsheetApp.flush();
+}
+
+function getValidLocationIds(apiKey) {
+  const url = "https://www.humanity.com/api/v2/locations";
+  const options = {
+    method: 'get',
+    headers: { 'Authorization': `Bearer ${apiKey}` },
+    muteHttpExceptions: true
+  };
+  try {
+    const response = UrlFetchApp.fetch(url, options);
+    const result = JSON.parse(response.getContentText());
+
+    if (result.status === 1 && Array.isArray(result.data)) {
+      return result.data.map(loc => String(loc.id));
+    } else {
+      Logger.log('⚠️ Failed to fetch location IDs');
+      return [];
+    }
+  } catch (e) {
+    Logger.log(`❌ Error fetching location list: ${e}`);
+    return [];
+  }
+}
