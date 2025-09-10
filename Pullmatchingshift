@@ -1,0 +1,106 @@
+const HUMANITY_API_TOKEN = 'eac3331e63e79a934a2040516d450bf8dfd4971c';
+const BASE_URL = 'https://www.humanity.com/api/v2/';
+const EST_TIMEZONE = 'America/New_York'; 
+
+function pullMatchingShift() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Shift Lookup");
+  let usedShiftIDs = new Set();
+  let hasChanges = true;
+
+  // Step 1: Collect already-used shift IDs from sheet (Column K)
+  const initialData = sheet.getDataRange().getValues();
+  for (let r = 1; r < initialData.length; r++) {
+    const existingShiftID = initialData[r][10]; // Column K
+    if (existingShiftID) {
+      usedShiftIDs.add(existingShiftID.toString());
+    }
+  }
+
+  // Step 2: Loop until no new changes
+  while (hasChanges) {
+    hasChanges = false;
+    const data = sheet.getDataRange().getValues();
+
+    for (let i = 1; i < data.length; i++) {
+      const date = data[i][0];                // Column A
+      const shiftTime = data[i][3];           // Column D
+      const locationID = String(data[i][5]).trim(); // Column F
+      const position = String(data[i][6]).trim();   // Column G
+      const status = data[i][7];              // Column H
+
+      if (!date || !shiftTime || !locationID || !position || shiftTime === "") continue;
+      if (status && status !== 'PENDING') continue;
+
+      if (!shiftTime.includes('-')) {
+        sheet.getRange(i + 1, 8).setValue('INVALID TIME FORMAT');
+        continue;
+      }
+
+      const [startTime, endTime] = shiftTime.split('-').map(s => s.trim().padStart(5, '0'));
+
+      // Convert sheet date to formatted EST date for API
+      const formattedDate = Utilities.formatDate(new Date(date), EST_TIMEZONE, 'yyyy-MM-dd');
+
+      const url = `${BASE_URL}shifts?start_date=${formattedDate}&end_date=${formattedDate}`;
+      const options = {
+        method: 'get',
+        headers: {
+          'Authorization': `Bearer ${HUMANITY_API_TOKEN}`
+        },
+        muteHttpExceptions: true
+      };
+
+      try {
+        const response = UrlFetchApp.fetch(url, options);
+        const result = JSON.parse(response.getContentText());
+
+        if (!result || !result.data || !Array.isArray(result.data)) {
+          sheet.getRange(i + 1, 8).setValue('NO SHIFTS FOUND');
+          continue;
+        }
+
+        const shifts = result.data;
+        let matchFound = false;
+
+        for (const shift of shifts) {
+          const shiftID = shift.id.toString();
+          if (usedShiftIDs.has(shiftID)) continue;
+
+          const shiftStart = shift.start_time?.time?.padStart(5, '0');
+          const shiftEnd = shift.end_time?.time?.padStart(5, '0');
+          const shiftLocID = String(shift.schedule_location_id).trim();
+          const shiftPos = String(shift.schedule_name).trim();
+          const employee = shift.employees?.[0];
+
+          if (
+            shiftStart === startTime &&
+            shiftEnd === endTime &&
+            shiftLocID === locationID &&
+            shiftPos === position
+          ) {
+            // ✅ Match found — update sheet
+            sheet.getRange(i + 1, 8).setValue('MATCH FOUND');
+            sheet.getRange(i + 1, 9).setValue(employee?.name || 'Unassigned');
+            sheet.getRange(i + 1, 10).setValue(employee?.id || '');
+            sheet.getRange(i + 1, 11).setValue(shiftID);
+
+            usedShiftIDs.add(shiftID);
+            matchFound = true;
+            hasChanges = true;
+            break;
+          }
+        }
+
+        if (!matchFound) {
+          sheet.getRange(i + 1, 8).setValue('NO MATCH');
+        }
+
+      } catch (error) {
+        Logger.log(error);
+        sheet.getRange(i + 1, 8).setValue('ERROR');
+      }
+    }
+  }
+
+  SpreadsheetApp.flush();
+}
