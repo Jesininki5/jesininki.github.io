@@ -1,0 +1,252 @@
+const HUMANITY_API_TOKEN = '92ecaf70c660c949db67ed99020edd51ec066611';
+const BASE_URL = 'https://www.humanity.com/api/v2/';
+const ACCOUNT_TZ = 'Asia/Manila';         // your Humanity account timezone (PHT)
+const UI_TZ = 'America/New_York';         // what you see in Humanity UI (EST/EDT)
+
+/**
+ * Pull matching shifts — matches by exact datetime (EST) + location + position.
+ */
+function pullMatchingShift() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Shift Lookup");
+  if (!sheet) throw new Error('Sheet "Shift Lookup" not found');
+  let usedShiftIDs = new Set();
+
+  // Seed used Shift IDs (Column K)
+  const initialData = sheet.getDataRange().getValues();
+  for (let r = 1; r < initialData.length; r++) {
+    const existingShiftID = initialData[r][10];
+    if (existingShiftID) usedShiftIDs.add(String(existingShiftID));
+  }
+
+  let hasChanges = true;
+  while (hasChanges) {
+    hasChanges = false;
+    const data = sheet.getDataRange().getValues();
+
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      const dateCell = row[0];              // Column A (Date)
+      const shiftTimeCell = String(row[3] || '').trim(); // Column D (Shift Time, e.g. "10:00-15:30")
+      const locationID = String(row[5] || '').trim();   // Column F
+      const position = String(row[6] || '').trim();     // Column G
+      const status = String(row[7] || '').trim();       // Column H
+
+      if (!dateCell || !shiftTimeCell || !locationID || !position) continue;
+      if (status && status !== 'PENDING') continue;
+      if (!shiftTimeCell.includes('-')) {
+        sheet.getRange(i + 1, 8).setValue('INVALID TIME FORMAT');
+        continue;
+      }
+
+      // parse times (assume either "HH:mm" in 24h or "H:mma"/"h:mma" formats)
+      const [rawStart, rawEnd] = shiftTimeCell.split('-').map(s => s.trim());
+      const startParts = parseTimeString(rawStart);
+      const endParts = parseTimeString(rawEnd);
+      if (!startParts || !endParts) {
+        sheet.getRange(i + 1, 8).setValue('INVALID TIME FORMAT');
+        continue;
+      }
+
+      // sheet date -> y,m,d numbers
+      const sheetDate = new Date(dateCell);
+      const year = sheetDate.getFullYear();
+      const month = sheetDate.getMonth() + 1;
+      const day = sheetDate.getDate();
+
+      // Build EST (UI_TZ) ISO instants for start and end (accounting for overnight)
+      const startYMD = getYMD(year, month, day, 0); // start uses same day
+      const endOffsetDays = (endParts.hour * 60 + endParts.min) <= (startParts.hour * 60 + startParts.min) ? 1 : 0;
+      const endYMD = getYMD(year, month, day, endOffsetDays);
+
+      const startIsoEST = buildIsoWithOffset(startYMD.y, startYMD.m, startYMD.d, startParts.hour, startParts.min, UI_TZ);
+      const endIsoEST = buildIsoWithOffset(endYMD.y, endYMD.m, endYMD.d, endParts.hour, endParts.min, UI_TZ);
+
+      const startDate_EST = new Date(startIsoEST);
+      const endDate_EST = new Date(endIsoEST);
+
+      // Convert EST instants to account timezone (PHT) and compute api date range
+      const apiStartDate = Utilities.formatDate(startDate_EST, ACCOUNT_TZ, 'yyyy-MM-dd');
+      const apiEndDate   = Utilities.formatDate(endDate_EST, ACCOUNT_TZ, 'yyyy-MM-dd');
+
+      // For safety, ensure apiStartDate <= apiEndDate (swap if not)
+      let apiStart = apiStartDate;
+      let apiEnd = apiEndDate;
+      if (apiEnd < apiStart) {
+        const tmp = apiStart; apiStart = apiEnd; apiEnd = tmp;
+      }
+
+      // Debug logging (uncomment if you want logs)
+      // Logger.log(`Row ${i+1} -> EST start:${startIsoEST} end:${endIsoEST}  API range:${apiStart} to ${apiEnd}`);
+
+      // Call API for that PHT date range
+      const url = `${BASE_URL}shifts?start_date=${apiStart}&end_date=${apiEnd}`;
+      const options = {
+        method: 'get',
+        headers: { 'Authorization': `Bearer ${HUMANITY_API_TOKEN}` },
+        muteHttpExceptions: true
+      };
+
+      try {
+        const response = UrlFetchApp.fetch(url, options);
+        const result = JSON.parse(response.getContentText());
+
+        if (!result || !result.data || !Array.isArray(result.data)) {
+          sheet.getRange(i + 1, 8).setValue('NO SHIFTS FOUND');
+          continue;
+        }
+
+        let matchFound = false;
+        const shifts = result.data;
+
+        // Expected time strings in EST for comparison (format "H:mm")
+        const expectedStartStr = Utilities.formatDate(startDate_EST, UI_TZ, 'H:mm');
+        const expectedEndStr   = Utilities.formatDate(endDate_EST, UI_TZ, 'H:mm');
+
+        for (const shift of shifts) {
+          const shiftID = String(shift.id || '');
+          if (usedShiftIDs.has(shiftID)) continue; // already used
+
+          // get shift start/end ISO if available; fallback to start_timestamp / end_timestamp
+          let shiftStartInstant = null;
+          let shiftEndInstant = null;
+
+          if (shift.start_date && shift.start_date.iso8601) {
+            shiftStartInstant = new Date(shift.start_date.iso8601);
+          } else if (shift.start_timestamp) {
+            // append account offset for parsing fallback
+            const accOffset = tzOffsetForDateFromString(shift.start_date ? shift.start_date.formatted : apiStart, ACCOUNT_TZ);
+            shiftStartInstant = new Date(shift.start_timestamp.replace(' ', 'T') + accOffset);
+          }
+
+          if (shift.end_date && shift.end_date.iso8601) {
+            shiftEndInstant = new Date(shift.end_date.iso8601);
+          } else if (shift.end_timestamp) {
+            const accOffset2 = tzOffsetForDateFromString(shift.end_date ? shift.end_date.formatted : apiEnd, ACCOUNT_TZ);
+            shiftEndInstant = new Date(shift.end_timestamp.replace(' ', 'T') + accOffset2);
+          }
+
+          if (!shiftStartInstant || !shiftEndInstant) continue; // cannot compare reliably
+
+          // Convert API shift instants into UI timezone (EST) strings
+          const shiftStart_EST_Str = Utilities.formatDate(shiftStartInstant, UI_TZ, 'H:mm');
+          const shiftEnd_EST_Str   = Utilities.formatDate(shiftEndInstant, UI_TZ, 'H:mm');
+
+          const shiftLocID = String(shift.schedule_location_id || '').trim();
+          const shiftPos = String(shift.schedule_name || '').trim();
+          const employee = (shift.employees && shift.employees[0]) ? shift.employees[0] : null;
+
+          // Compare datetimes/times and other attributes
+          // Allow small tolerance: exact string equality on formatted H:mm (should be exact since we built start/end EST above)
+          if (
+            shiftStart_EST_Str === expectedStartStr &&
+            shiftEnd_EST_Str === expectedEndStr &&
+            shiftLocID === locationID &&
+            shiftPos === position
+          ) {
+            // Matched
+            sheet.getRange(i + 1, 8).setValue('MATCH FOUND');                 // Status
+            sheet.getRange(i + 1, 9).setValue(employee?.name || 'Unassigned');
+            sheet.getRange(i + 1, 10).setValue(employee?.id || '');
+            sheet.getRange(i + 1, 11).setValue(shiftID);
+
+            usedShiftIDs.add(shiftID);
+            matchFound = true;
+            hasChanges = true;
+            break;
+          }
+        }
+
+        if (!matchFound) sheet.getRange(i + 1, 8).setValue('NO MATCH');
+      } catch (err) {
+        Logger.log('Error row ' + (i+1) + ': ' + err);
+        sheet.getRange(i + 1, 8).setValue('ERROR');
+      }
+    } // end for rows
+  } // end while
+
+  SpreadsheetApp.flush();
+}
+
+/* ---------------- Helper utilities ---------------- */
+
+function pad(n) { return n < 10 ? '0' + n : String(n); }
+
+/**
+ * parseTimeString accepts inputs like:
+ *  "10:00", "9:30", "10:00am", "10:00 pm", "22:30"
+ * returns {hour: Number(0-23), min: Number}
+ */
+function parseTimeString(s) {
+  if (!s) return null;
+  s = String(s).trim().toLowerCase();
+  // detect am/pm
+  const ampm = s.match(/(am|pm)$/);
+  let hour = 0, min = 0;
+
+  // remove spaces around am/pm
+  s = s.replace(/\s*(am|pm)$/, '$1');
+
+  if (ampm) {
+    // time with am/pm
+    const t = s.replace(/(am|pm)$/, '');
+    const parts = t.split(':').map(p => p.trim());
+    hour = Number(parts[0]) || 0;
+    min = Number(parts[1] || 0) || 0;
+    if (ampm[0] === 'pm' && hour < 12) hour += 12;
+    if (ampm[0] === 'am' && hour === 12) hour = 0;
+    return { hour: hour, min: min };
+  } else {
+    // 24-hour style
+    const parts = s.split(':').map(p => p.trim());
+    hour = Number(parts[0]) || 0;
+    min = Number(parts[1] || 0) || 0;
+    return { hour: hour, min: min };
+  }
+}
+
+/**
+ * Return normalized YMD after adding offsetDays (handles month/year rollovers)
+ */
+function getYMD(year, month, day, offsetDays) {
+  // Create a UTC date then add offsetDays using UTC functions
+  const dt = new Date(Date.UTC(year, month - 1, day, 12, 0, 0)); // use noon UTC to avoid DST edgecases
+  dt.setUTCDate(dt.getUTCDate() + offsetDays);
+  return { y: dt.getUTCFullYear(), m: dt.getUTCMonth() + 1, d: dt.getUTCDate() };
+}
+
+/**
+ * Get timezone offset string like "-0400" or "+0800" for given timezone on that date.
+ */
+function tzOffsetForDate(timezone, year, month, day) {
+  // Use noon UTC on that calendar day (safe) and format into timezone 'Z'
+  const dt = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+  return Utilities.formatDate(dt, timezone, 'Z'); // returns something like "-0400" or "+0800"
+}
+
+/**
+ * Build ISO-like timestamp string for a local (wall-clock) time in a given timezone.
+ * Example output: "2025-08-01T10:00:00-0400"
+ */
+function buildIsoWithOffset(year, month, day, hour, minute, timezone) {
+  const offset = tzOffsetForDate(timezone, year, month, day);
+  return `${year}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(minute)}:00${offset}`;
+}
+
+/**
+ * tzOffsetForDate helper when only have a formatted day string (fallback). Returns e.g. "-0400".
+ * If input formattedDay is like "Jul 16, 2025" it will attempt to parse it.
+ */
+function tzOffsetForDateFromString(formattedDay, timezone) {
+  try {
+    // Try parsing formattedDay via Date — fallback; use noon of that date in UTC for offset
+    const dt = new Date(formattedDay);
+    const y = dt.getFullYear();
+    const m = dt.getMonth() + 1;
+    const d = dt.getDate();
+    return tzOffsetForDate(timezone, y, m, d);
+  } catch (e) {
+    // Ultimately fall back to querying offset for today
+    const t = new Date();
+    return tzOffsetForDate(timezone, t.getFullYear(), t.getMonth() + 1, t.getDate());
+  }
+}
